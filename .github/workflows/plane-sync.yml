@@ -1,0 +1,130 @@
+name: Plane sync (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      workspace_slug:
+        description: Plane workspace slug
+        required: false
+        type: string
+        default: cloudinc
+      project_prefix:
+        description: Plane project identifier prefix (e.g. BILL, CHAT, DONOR)
+        required: true
+        type: string
+      project_id:
+        description: Plane project UUID
+        required: true
+        type: string
+      plane_base_url:
+        description: Plane base URL
+        required: false
+        type: string
+        default: https://plane.cloudinc.io
+    secrets:
+      plane_api_token:
+        required: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract Plane issue ID from PR title or branch
+        id: extract
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          PREFIX: ${{ inputs.project_prefix }}
+        run: |
+          set -euo pipefail
+          # Match <PREFIX>-<N> in PR title first, then in branch name. Title takes priority.
+          re="${PREFIX}-([0-9]+)"
+          if [[ "$PR_TITLE" =~ $re ]]; then
+            seq="${BASH_REMATCH[1]}"
+          elif [[ "$BRANCH" =~ ${PREFIX,,}-([0-9]+) ]]; then
+            seq="${BASH_REMATCH[1]}"
+          else
+            echo "no-${PREFIX}-id-in-pr-title-or-branch — skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "seq=$seq" >> "$GITHUB_OUTPUT"
+          echo "Matched ${PREFIX}-$seq"
+
+      - name: Resolve issue UUID by sequence_id
+        if: steps.extract.outputs.skip != 'true'
+        id: resolve
+        env:
+          API_KEY: ${{ secrets.plane_api_token }}
+          BASE: ${{ inputs.plane_base_url }}
+          WS: ${{ inputs.workspace_slug }}
+          PID: ${{ inputs.project_id }}
+          SEQ: ${{ steps.extract.outputs.seq }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sS -H "X-API-Key: $API_KEY" \
+            "$BASE/api/v1/workspaces/$WS/projects/$PID/issues/?expand=&fields=id,sequence_id&per_page=100&page=1")
+          uuid=$(echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('results',d); m=[i for i in r if i.get('sequence_id')==int('$SEQ')]; print(m[0]['id'] if m else '')")
+          if [ -z "$uuid" ]; then
+            # Fall back to paginated search if not on first page
+            page=2
+            while [ -z "$uuid" ] && [ "$page" -le 20 ]; do
+              resp=$(curl -sS -H "X-API-Key: $API_KEY" \
+                "$BASE/api/v1/workspaces/$WS/projects/$PID/issues/?fields=id,sequence_id&per_page=100&page=$page")
+              uuid=$(echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('results',d); m=[i for i in r if i.get('sequence_id')==int('$SEQ')]; print(m[0]['id'] if m else '')")
+              [ -z "$(echo "$resp" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('next_page_results'))")" ] && break
+              page=$((page+1))
+            done
+          fi
+          if [ -z "$uuid" ]; then
+            echo "Issue ${{ inputs.project_prefix }}-$SEQ not found in Plane project $PID"; exit 1
+          fi
+          echo "uuid=$uuid" >> "$GITHUB_OUTPUT"
+
+      - name: Map PR action to Plane state
+        if: steps.extract.outputs.skip != 'true'
+        id: state
+        env:
+          ACTION: ${{ github.event.action }}
+          MERGED: ${{ github.event.pull_request.merged }}
+        run: |
+          # PR opened/reopened   -> In Progress (group: started)
+          # PR merged            -> Done (group: completed)
+          # PR closed unmerged   -> leave alone
+          if [ "$ACTION" = "closed" ] && [ "$MERGED" = "true" ]; then
+            echo "group=completed" >> "$GITHUB_OUTPUT"
+          elif [ "$ACTION" = "opened" ] || [ "$ACTION" = "reopened" ] || [ "$ACTION" = "ready_for_review" ]; then
+            echo "group=started" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find target Plane state UUID
+        if: steps.extract.outputs.skip != 'true' && steps.state.outputs.skip != 'true'
+        id: target
+        env:
+          API_KEY: ${{ secrets.plane_api_token }}
+          BASE: ${{ inputs.plane_base_url }}
+          WS: ${{ inputs.workspace_slug }}
+          PID: ${{ inputs.project_id }}
+          GROUP: ${{ steps.state.outputs.group }}
+        run: |
+          resp=$(curl -sS -H "X-API-Key: $API_KEY" \
+            "$BASE/api/v1/workspaces/$WS/projects/$PID/states/")
+          state_id=$(echo "$resp" | python3 -c "import sys,json; r=json.load(sys.stdin); m=[s for s in r if s.get('group')=='$GROUP']; m.sort(key=lambda s:(not s.get('default'),s.get('sequence',0))); print(m[0]['id'] if m else '')")
+          if [ -z "$state_id" ]; then echo "no state in group $GROUP"; exit 1; fi
+          echo "state_id=$state_id" >> "$GITHUB_OUTPUT"
+
+      - name: Patch Plane issue
+        if: steps.extract.outputs.skip != 'true' && steps.state.outputs.skip != 'true'
+        env:
+          API_KEY: ${{ secrets.plane_api_token }}
+          BASE: ${{ inputs.plane_base_url }}
+          WS: ${{ inputs.workspace_slug }}
+          PID: ${{ inputs.project_id }}
+          UUID: ${{ steps.resolve.outputs.uuid }}
+          STATE: ${{ steps.target.outputs.state_id }}
+        run: |
+          curl -fsS -X PATCH "$BASE/api/v1/workspaces/$WS/projects/$PID/issues/$UUID/" \
+            -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+            -d "{\"state\":\"$STATE\"}" | head -c 200; echo
