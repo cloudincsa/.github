@@ -111,7 +111,7 @@ jobs:
         run: |
           resp=$(curl -sS -H "X-API-Key: $API_KEY" \
             "$BASE/api/v1/workspaces/$WS/projects/$PID/states/")
-          state_id=$(echo "$resp" | python3 -c "import sys,json; r=json.load(sys.stdin); m=[s for s in r if s.get('group')=='$GROUP']; m.sort(key=lambda s:(not s.get('default'),s.get('sequence',0))); print(m[0]['id'] if m else '')")
+          state_id=$(echo "$resp" | python3 -c "import sys,json; r=json.load(sys.stdin); m=[s for s in (r.get('results',r) if isinstance(r,dict) else r) if s.get('group')=='$GROUP']; m.sort(key=lambda s:(not s.get('default'),s.get('sequence',0))); print(m[0]['id'] if m else '')")
           if [ -z "$state_id" ]; then echo "no state in group $GROUP"; exit 1; fi
           echo "state_id=$state_id" >> "$GITHUB_OUTPUT"
 
